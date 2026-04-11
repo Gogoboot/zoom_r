@@ -1,42 +1,23 @@
 [package]
 name = "signaling-server"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-# Axum — это веб-фреймворк. Он умеет обрабатывать HTTP-запросы и WebSocket-соединения.
-# features = ["ws"] — включает поддержку WebSocket.
 axum = { version = "0.7", features = ["ws"] }
-
-# Tokio — асинхронный рантайм. Позволяет писать код, 
-# который не блокирует поток при ожидании (например, при чтении из сокета). 
-# full — включает все возможности.
 tokio = { version = "1", features = ["full"] }
-
-# Serde — сериализация/десериализация данных. 
-# Превращает структуры Rust в JSON и обратно.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# Tracing — библиотека для логирования (вывода сообщений в консоль). 
-# tracing-subscriber настраивает, что и как выводить.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Упрощают обработку ошибок. anyhow для быстрых ошибок в бинарниках, 
-# thiserror для библиотек.
-anyhow = "1"
 thiserror = "1"
-
-# Загружает переменные окружения из файла .env.
 dotenvy = "0.15"
-
-# Потокобезопасная хеш-таблица. Позволяет одновременно читать
-# и писать из разных потоков без блокировок всей таблицы.
-dashmap = "5.5"   # для потокобезопасного хранилища комнат
-
-# Утилиты для работы с асинхронными потоками 
-# (например, split для разделения сокета на отправителя и получателя).
+dashmap = "5.5"
 futures-util = "0.3"
-
 uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+envy = "0.4"
+
+[dev-dependencies]
+mockall = "0.12"
+tokio-test = "0.4"

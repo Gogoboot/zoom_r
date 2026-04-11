@@ -1,21 +1,8 @@
 //! Оркестратор соединений.
 //!
-//! Управляет жизненным циклом WebSocket-подключения:
-//! 1. Принимает входящие сообщения
-//! 2. Маршрутизирует их к соответствующим обработчикам
-//! 3. Отслеживает состояние соединения (рукопожатие / в комнате / закрыто)
-//! 4. Обрабатывает ошибки и отправляет ответы клиентам
-//! 5. Гарантирует очистку ресурсов при разрыве соединения
-//!
-//! # Архитектура
-//!
-//! Оркестратор параметризован трейтом [`RoomRepository`], что позволяет:
-//! - Легко заменять хранилище (in-memory, Redis, etc.)
-//! - Тестировать логику с моками
-//! - Соблюдать принцип инверсии зависимостей (DIP)
+//! Управляет жизненным циклом, связывает Repository и Registry.
 
 pub mod error;
-
 pub use error::OrchestratorError;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -26,64 +13,28 @@ use tracing::{debug, error, instrument};
 use crate::domain::{ClientMessage, ServerMessage};
 use crate::error::{AppError, AppResult};
 use crate::handlers::{handle_create_room, handle_join_room, handle_leave_room};
-use crate::infrastructure::RoomRepository;
+use crate::infrastructure::{ConnectionRegistry, RoomRepository};
 use crate::transport::split_socket;
 
-/// Состояние активного соединения.
-///
-/// Явное представление состояния упрощает отладку и предотвращает ошибки,
-/// связанные с неинициализированным контекстом.
 #[derive(Debug, Clone)]
 enum ConnectionState {
-    /// Соединение установлено, но участник ещё не в комнате.
     Handshaking,
-    /// Участник присоединён к комнате.
     InRoom { room_id: String, participant_id: String },
 }
 
-/// Оркестратор, управляющий одним WebSocket-соединением.
-///
-/// Параметризован трейтом [`RoomRepository`] для инверсии зависимостей.
-///
-/// # Пример
-///
-/// ```rust
-/// # use signaling_server::{Orchestrator, MemoryRoomStore};
-/// let store = MemoryRoomStore::new();
-/// let orchestrator = Orchestrator::new(store);
-/// // orchestrator.handle_connection(socket).await;
-/// ```
+/// Оркестратор.
+/// Теперь хранит и Repository, и Registry.
+#[derive(Clone)]
 pub struct Orchestrator<R: RoomRepository> {
     repo: R,
+    registry: ConnectionRegistry,
 }
 
 impl<R: RoomRepository + Clone> Orchestrator<R> {
-    /// Создаёт новый оркестратор с заданным репозиторием.
-    ///
-    /// # Аргументы
-    ///
-    /// - `repo`: реализация [`RoomRepository`] для хранения данных о комнатах
-    ///
-    /// # Возвращает
-    ///
-    /// Новый экземпляр `Orchestrator<R>`
-    pub fn new(repo: R) -> Self {
-        Self { repo }
+    pub fn new(repo: R, registry: ConnectionRegistry) -> Self {
+        Self { repo, registry }
     }
 
-    /// Обрабатывает WebSocket-соединение от начала до завершения.
-    ///
-    /// # Процесс
-    ///
-    /// 1. Разделяет сокет на каналы чтения/записи
-    /// 2. Инициализирует состояние `Handshaking`
-    /// 3. В цикле читает сообщения и маршрутизирует их
-    /// 4. При ошибке отправляет ответ клиенту и закрывает соединение
-    /// 5. При разрыве — удаляет участника из комнаты (очистка)
-    ///
-    /// # Аргументы
-    ///
-    /// - `socket`: установленное WebSocket-соединение от Axum
     #[instrument(skip(self, socket), fields(connection = "websocket"))]
     pub async fn handle_connection(&self, socket: WebSocket) {
         let (sender, mut receiver) = split_socket(socket);
@@ -122,52 +73,25 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
             }
         }
 
-        // Очистка: удаляем участника из комнаты при разрыве соединения
+        // ✅ Очистка при разрыве
         if let ConnectionState::InRoom { room_id, participant_id } = state {
             debug!("Cleaning up: removing participant {} from room {}", participant_id, room_id);
-            if let Err(e) = handle_leave_room(&self.repo, &room_id, &participant_id).await {
-                error!("Failed to cleanup participant on disconnect: {}", e);
+            if let Err(e) = handle_leave_room(&self.repo, &self.registry, &room_id, &participant_id).await {
+                error!("Failed to cleanup on disconnect: {}", e);
             }
         }
-
         debug!("WebSocket connection closed");
     }
 
-    /// Отправляет ошибку клиенту в формате JSON.
-    ///
-    /// # Аргументы
-    ///
-    /// - `sender`: канал для отправки сообщений клиенту
-    /// - `message`: текст ошибки для отображения
-    ///
-    /// # Возвращает
-    ///
-    /// - `Ok(())` — сообщение успешно отправлено
-    /// - `Err(AppError)` — ошибка отправки или сериализации
-    async fn send_error(
-        &self,
-        sender: &UnboundedSender<String>,
-        message: &str,
-    ) -> AppResult<()> {
-        let err_msg = serde_json::to_string(&ServerMessage::Error {
-            message: message.to_string(),
-        })?;
+    async fn send_error(&self, sender: &UnboundedSender<String>, message: &str) -> AppResult<()> {
+        let err_msg = serde_json::to_string(&ServerMessage::Error { message: message.to_string() })?;
         sender.send(err_msg)
             .map_err(|e| AppError::Transport(crate::transport::TransportError::WebSocket(
-                format!("Failed to send error message: {}", e)
-    )))?;
-            Ok(())
+                format!("Failed to send error: {}", e)
+            )))?;
+        Ok(())
     }
 
-    /// Обрабатывает первое сообщение соединения (рукопожатие).
-    ///
-    /// Ожидает `CreateRoom` или `JoinRoom`. Любое другое сообщение — ошибка.
-    ///
-    /// # Возвращает
-    ///
-    /// - `Ok(Some((room_id, participant_id)))` — успешное присоединение
-    /// - `Ok(None)` — не применяется для начального состояния
-    /// - `Err(AppError)` — ошибка парсинга или бизнес-логики
     #[instrument(skip(self, sender))]
     async fn handle_initial_message(
         &self,
@@ -178,12 +102,12 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
 
         match msg {
             ClientMessage::CreateRoom => {
-                let (room_id, participant_id) = handle_create_room(&self.repo, sender.clone()).await?;
+                let (room_id, participant_id) = handle_create_room(&self.repo, &self.registry, sender.clone()).await?;
                 debug!("Created room {} with participant {}", room_id, participant_id);
                 Ok(Some(ConnectionState::InRoom { room_id, participant_id }))
             }
             ClientMessage::JoinRoom { room_id, display_name } => {
-                let (room_id, participant_id) = handle_join_room(&self.repo, room_id, display_name, sender.clone()).await?;
+                let (room_id, participant_id) = handle_join_room(&self.repo, &self.registry, room_id, display_name, sender.clone()).await?;
                 debug!("Joined room {} as participant {}", room_id, participant_id);
                 Ok(Some(ConnectionState::InRoom { room_id, participant_id }))
             }
@@ -193,44 +117,32 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
         }
     }
 
-    /// Обрабатывает сообщения, когда участник уже в комнате.
-    ///
-    /// Поддерживает: `Offer`, `Answer`, `IceCandidate`, `LeaveRoom`.
-    ///
-    /// # Возвращает
-    ///
-    /// - `Ok(Some(state))` — продолжить соединение в том же состоянии
-    /// - `Ok(None)` — участник покинул комнату, соединение можно закрыть
-    /// - `Err(AppError)` — ошибка обработки
-/// Обрабатывает сообщения, когда участник уже в комнате.
-///
-/// Поддерживает: `Offer`, `Answer`, `IceCandidate`, `LeaveRoom`.
     #[instrument(skip(self, _sender), fields(room_id, participant_id))]
     async fn handle_message_in_room(
         &self,
         room_id: &str,
         participant_id: &str,
         text: &str,
-        _sender: &UnboundedSender<String>,  // ← изменено на _sender
+        _sender: &UnboundedSender<String>,
     ) -> AppResult<Option<ConnectionState>> {
         let msg: ClientMessage = serde_json::from_str(text)?;
 
         match msg {
             ClientMessage::Offer { target_id, sdp } => {
                 debug!("Forwarding offer from {} to {}", participant_id, target_id);
-                crate::handlers::handle_offer(&self.repo, room_id, participant_id, &target_id, sdp).await?;
+                crate::handlers::handle_offer(&self.repo, &self.registry, room_id, participant_id, &target_id, sdp).await?;
             }
             ClientMessage::Answer { target_id, sdp } => {
                 debug!("Forwarding answer from {} to {}", participant_id, target_id);
-                crate::handlers::handle_answer(&self.repo, room_id, participant_id, &target_id, sdp).await?;
+                crate::handlers::handle_answer(&self.repo, &self.registry, room_id, participant_id, &target_id, sdp).await?;
             }
             ClientMessage::IceCandidate { target_id, candidate } => {
                 debug!("Forwarding ICE candidate from {} to {}", participant_id, target_id);
-                crate::handlers::handle_ice_candidate(&self.repo, room_id, participant_id, &target_id, candidate).await?;
+                crate::handlers::handle_ice_candidate(&self.repo, &self.registry, room_id, participant_id, &target_id, candidate).await?;
             }
             ClientMessage::LeaveRoom => {
                 debug!("Participant {} leaving room {}", participant_id, room_id);
-                handle_leave_room(&self.repo, room_id, participant_id).await?;
+                handle_leave_room(&self.repo, &self.registry, room_id, participant_id).await?;
                 return Ok(None);
             }
             _ => {
@@ -239,7 +151,6 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
                 )));
             }
         }
-
         Ok(Some(ConnectionState::InRoom {
             room_id: room_id.to_string(),
             participant_id: participant_id.to_string(),
