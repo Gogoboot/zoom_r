@@ -73,13 +73,26 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
             }
         }
 
-        // ✅ Очистка при разрыве
-        if let ConnectionState::InRoom { room_id, participant_id } = state {
-            debug!("Cleaning up: removing participant {} from room {}", participant_id, room_id);
-            if let Err(e) = handle_leave_room(&self.repo, &self.registry, &room_id, &participant_id).await {
-                error!("Failed to cleanup on disconnect: {}", e);
+        // ✅ Очистка при разрыве + Эфемерность
+        if let ConnectionState::InRoom { ref room_id, participant_id } = state {
+            debug!( "Cleaning up: removing participant {} from room {} ", participant_id, room_id);
+            
+            // 1. Удаляем участника из комнаты и реестра
+            if let Err(e) = handle_leave_room(&self.repo, &self.registry, room_id, &participant_id).await {
+                error!( "Failed to cleanup participant: {} ", e);
+            }
+
+            // 2. Проверяем, пуста ли комната теперь (Эфемерность)
+            if let Ok(Some(room)) = self.repo.get(room_id).await {
+                if room.is_empty() {
+                    debug!( "🧹 Room {} is empty. Auto-deleting... ", room_id);
+                    if let Err(e) = self.repo.remove(room_id).await {
+                        error!( "Failed to remove empty room {}: {} ", room_id, e);
+                    }
+                }
             }
         }
+
         debug!("WebSocket connection closed");
     }
 

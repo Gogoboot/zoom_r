@@ -1,13 +1,16 @@
 //! Ошибки доменного слоя.
-
+// src/domain/error.rs
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DomainError {
-    #[error("Room not found: {0}")]
+    // 👇 Добавь или обнови эту строку:
+    #[error("Комната не найдена или уже удалена: {0}")]
     RoomNotFound(String),
-    #[error("Participant not found: {0}")]
+
+    #[error("Участник не найден: {0}")]
     ParticipantNotFound(String),
-    #[error("Invalid message: {0}")]
+
+    #[error("Неверное сообщение: {0}")]
     InvalidMessage(String),
 }

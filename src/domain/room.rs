@@ -47,4 +47,10 @@ impl Room {
     pub fn has_participant(&self, participant_id: &str) -> bool {
         self.participants.contains_key(participant_id)
     }
+
+    /// Безопасно проверяет, есть ли в комнате участники
+    pub fn is_empty(&self) -> bool {
+        self.participants.is_empty()
+    }
+
 }
