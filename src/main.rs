@@ -5,6 +5,7 @@ use axum::extract::State;
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
+use tokio::signal; // Импорт для перехвата Ctrl+C
 use tracing::info;
 
 // Импортируем публичные типы из нашей библиотеки
@@ -41,7 +42,18 @@ async fn main() -> Result<(), signaling_server::AppError> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
     info!("Server listening on {}", listener.local_addr()?);
 
-    axum::serve(listener, app).await?;
+    // 5. Сигнал для корректного завершения работы
+    let shutdown_signal = async {
+        signal::ctrl_c().await.expect("Failed to install CTRL+C signal handler");
+        info!("🛑 Получен сигнал остановки (Ctrl+C). Завершаем работу...");
+    };
+
+    // 6. Запуск с поддержкой graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
+
+    info!("✅ Сервер успешно остановлен. Все соединения закрыты.");
     Ok(())
 }
 
