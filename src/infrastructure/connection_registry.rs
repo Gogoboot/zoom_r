@@ -2,15 +2,17 @@
 //!
 //! Хранит маппинг ParticipantId -> WebSocketSender.
 //! Позволяет отправлять сообщения, не храня sender внутри сущностей домена.
-
 use std::sync::Arc;
+use axum::extract::ws::Message; // ✅ Добавляем импорт Message
 use dashmap::DashMap;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc; // ✅ Добавляем импорт mpsc
 
-pub type WebSocketSender = UnboundedSender<String>;
+// ✅ НОВЫЙ ТИП: ограниченный канал с нативными кадрами
+// Ёмкость 64 достаточна для пиков сигнализации (пункт 2)
+pub type WebSocketSender = mpsc::Sender<Message>;
 
 /// Реестр подключений.
-/// Потокобезопасен благодаря Arc<DashMap>.
+/// Потокобезопасен благодаря Arc.
 #[derive(Clone)]
 pub struct ConnectionRegistry {
     connections: Arc<DashMap<String, WebSocketSender>>,
@@ -34,6 +36,7 @@ impl ConnectionRegistry {
     }
 
     /// Получает отправителя для конкретного участника.
+    /// Возвращает клон канала для отправки.
     pub fn get_sender(&self, participant_id: &str) -> Option<WebSocketSender> {
         self.connections.get(participant_id).map(|entry| entry.value().clone())
     }

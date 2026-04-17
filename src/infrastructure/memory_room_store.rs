@@ -1,5 +1,4 @@
 //! Реализация хранилища комнат в памяти (DashMap).
-
 use std::sync::Arc;
 use dashmap::DashMap;
 use async_trait::async_trait;
@@ -31,7 +30,6 @@ impl RoomRepository for MemoryRoomStore {
     }
 
     async fn get_mut(&self, room_id: &str) -> Result<Option<Room>, InfraError> {
-        // Возвращаем копию для изменения; в реальном коде нужно осторожнее, но для учебного проекта допустимо.
         Ok(self.rooms.get(room_id).map(|r| r.clone()))
     }
 
@@ -41,5 +39,13 @@ impl RoomRepository for MemoryRoomStore {
 
     async fn contains(&self, room_id: &str) -> Result<bool, InfraError> {
         Ok(self.rooms.contains_key(room_id))
+    }
+
+    /// Атомарная проверка и удаление. DashMap гарантирует, что операция
+    /// выполняется под внутренней блокировкой, без гонок состояний.
+    async fn remove_if_empty(&self, room_id: &str) -> Result<(), InfraError> {
+        // remove_if возвращает Some, если условие true и запись удалена
+        self.rooms.remove_if(room_id, |_, room| room.is_empty());
+        Ok(())
     }
 }
