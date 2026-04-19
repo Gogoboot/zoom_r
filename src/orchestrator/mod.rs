@@ -5,27 +5,14 @@
 //! - Маршрутизирует к обработчикам (handlers)
 //! - Управляет состоянием соединения (рукопожатие / в комнате)
 //! - Гарантирует очистку ресурсов при разрыве связи
-//!
-//! # Архитектурные решения
-//!
-//! 1. **Ограниченный канал (bounded channel)**: `mpsc::Sender<Message>` с лимитом 64
-//!    защищает от утечки памяти при медленных клиентах.
-//! 2. **Таймер бездействия (idle timeout)**: сбрасывается при ЛЮБОМ кадре (включая Ping),
-//!    а не только при текстовых сообщениях.
-//! 3. **Серверный Keepalive (пульсация связи)**: автоматическая отправка Ping каждые 30 сек.
-//!    Предотвращает разрыв соединения со стороны NAT/фаерволов.
-//! 4. **Идемпотентность (idempotent)**: `handle_leave_room` можно вызывать многократно —
-//!    повторный вызов не ломает состояние.
-//! 5. **Атомарное удаление (atomic removal)**: проверка «пуста ли комната» и удаление
-//!    выполняются в одной операции через `DashMap::remove_if`.
 
 pub mod error;
 pub use error::OrchestratorError;
 
 use axum::extract::ws::{Message, WebSocket};
-use futures_util::{pin_mut, StreamExt}; // ✅ pin_mut! для фиксации будущего (future) в памяти
-use tokio::sync::mpsc; // ✅ Ограниченный канал вместо UnboundedSender
-use tokio::time::{sleep, interval, Duration, Instant, MissedTickBehavior}; // ✅ Добавили interval для Keepalive
+use futures_util::{pin_mut, StreamExt};
+use tokio::sync::mpsc;
+use tokio::time::{sleep, interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, instrument, warn};
 
 use crate::domain::{ClientMessage, ServerMessage};
@@ -33,6 +20,15 @@ use crate::error::{AppError, AppResult};
 use crate::handlers::{handle_create_room, handle_join_room, handle_leave_room};
 use crate::infrastructure::{ConnectionRegistry, RoomRepository};
 use crate::transport::split_socket;
+
+// ─────────────────────────────────────────────────────────────
+// Константы валидации полезных нагрузок (payload validation)
+// ─────────────────────────────────────────────────────────────
+const MAX_SDP_LENGTH: usize = 32_000;
+const MAX_ICE_CANDIDATE_LENGTH: usize = 2_048; // Увеличили лимит для JSON-объекта
+const SDP_REQUIRED_PREFIX: &str = "v=0\r\n";
+// ICE-кандидаты приходят как JSON-объект, ищем ключ "candidate":
+const ICE_REQUIRED_JSON_KEY: &str = "\"candidate\":";
 
 #[derive(Debug, Clone)]
 enum ConnectionState {
@@ -51,18 +47,47 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
         Self { repo, registry }
     }
 
+    /// Валидирует размер и базовый формат WebRTC-сообщений.
+    fn validate_signaling_message(msg: &ClientMessage) -> AppResult<()> {
+        match msg {
+            ClientMessage::Offer { sdp, .. } | ClientMessage::Answer { sdp, .. } => {
+                if sdp.len() > MAX_SDP_LENGTH {
+                    return Err(AppError::Domain(crate::domain::DomainError::InvalidMessage(
+                        format!("SDP превышает лимит: {} байт (макс. {})", sdp.len(), MAX_SDP_LENGTH)
+                    )));
+                }
+                if !sdp.starts_with(SDP_REQUIRED_PREFIX) {
+                    return Err(AppError::Domain(crate::domain::DomainError::InvalidMessage(
+                        "Неверный формат SDP: отсутствует заголовок 'v=0\\r\\n'".into()
+                    )));
+                }
+            }
+            ClientMessage::IceCandidate { candidate, .. } => {
+                if candidate.len() > MAX_ICE_CANDIDATE_LENGTH {
+                    return Err(AppError::Domain(crate::domain::DomainError::InvalidMessage(
+                        format!("ICE-кандидат превышает лимит: {} байт", candidate.len())
+                    )));
+                }
+                // ✅ ИСПРАВЛЕНО: проверяем наличие JSON-ключа, а не SDP-префикса
+                if !candidate.contains(ICE_REQUIRED_JSON_KEY) {
+                    return Err(AppError::Domain(crate::domain::DomainError::InvalidMessage(
+                        "Неверный формат ICE-кандидата: отсутствует поле 'candidate'".into()
+                    )));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self, socket), fields(connection = "websocket"))]
     pub async fn handle_connection(&self, socket: WebSocket) {
         let (sender, mut receiver) = split_socket(socket);
         let mut state = ConnectionState::Handshaking;
 
-        // ✅ ПУНКТ 3: Таймер бездействия (idle timeout)
         let idle_timer = sleep(Duration::from_secs(60));
         pin_mut!(idle_timer);
 
-        // ✅ БЛОК 1.3: Серверный Keepalive (пульсация связи)
-        // Отправляем Ping каждые 30 секунд. MissedTickBehavior::Skip гарантирует,
-        // что при задержках клиента мы не накапливаем очередь пингов.
         let mut keepalive = interval(Duration::from_secs(30));
         keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -70,26 +95,18 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
 
         loop {
             tokio::select! {
-                biased; // Приоритет чтению перед таймерами
+                biased;
 
-                // ─────────────────────────────────────────────
-                // Ветка 1: Серверный Ping (Keepalive)
-                // ─────────────────────────────────────────────
                 _ = keepalive.tick() => {
-                    // Пробуем отправить пустой Ping. Если канал закрыт/переполнен — выходим.
                     if sender.try_send(Message::Ping(vec![])).is_err() {
-                        warn!("Не удалось отправить Keepalive Ping (канал недоступен)");
+                        warn!("Не удалось отправить Keepalive Ping");
                         break;
                     }
                 }
 
-                // ─────────────────────────────────────────────
-                // Ветка 2: Чтение кадра из WebSocket
-                // ─────────────────────────────────────────────
                 frame = receiver.next() => {
                     match frame {
                         Some(Ok(msg)) => {
-                            // ✅ СБРОС ТАЙМЕРА ПРИ ЛЮБОМ КАДРЕ
                             idle_timer.as_mut().reset(Instant::now() + Duration::from_secs(60));
 
                             match msg {
@@ -113,7 +130,7 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
 
                                     match result {
                                         Ok(Some(new_state)) => state = new_state,
-                                        Ok(None) => break, // LeaveRoom
+                                        Ok(None) => break,
                                         Err(e) => {
                                             error!("Ошибка обработки сообщения: {}", e);
                                             let _ = self.send_error(&sender, &e.to_string()).await;
@@ -122,33 +139,31 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
                                     }
                                 }
                                 Message::Binary(_) => {
-                                    debug!("Игнорируем бинарный кадр (signaling работает с JSON)");
+                                    debug!("Игнорируем бинарный кадр");
                                 }
                             }
                         }
                         Some(Err(e)) => { error!("Ошибка потока WebSocket: {}", e); break; }
-                        None => { debug!("Поток завершён (клиент отключился)"); break; }
+                        None => {
+                            debug!("Поток завершён");
+                            break;
+                        }
                     }
                 }
 
-                // ─────────────────────────────────────────────
-                // Ветка 3: Сработал таймаут бездействия
-                // ─────────────────────────────────────────────
                 _ = &mut idle_timer => {
-                    warn!("⏱️ Таймаут бездействия (60 сек без кадров). Закрываем соединение.");
+                    warn!("⏱️ Таймаут бездействия. Закрываем соединение.");
                     break;
                 }
             }
         }
 
-        // Очистка состояния при выходе из цикла
         if let ConnectionState::InRoom { ref room_id, participant_id } = state {
             debug!("🧹 Очистка: удаление участника {} из комнаты {}", participant_id, room_id);
             if let Err(e) = handle_leave_room(&self.repo, &self.registry, room_id, &participant_id).await {
                 error!("Не удалось выполнить очистку участника: {}", e);
             }
 
-            // Атомарное удаление пустой комнаты
             if let Err(e) = self.repo.remove_if_empty(room_id).await {
                 error!("Не удалось атомарно удалить пустую комнату {}: {}", room_id, e);
             }
@@ -178,6 +193,7 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
         sender: &mpsc::Sender<Message>,
     ) -> AppResult<Option<ConnectionState>> {
         let msg: ClientMessage = serde_json::from_str(text)?;
+        Self::validate_signaling_message(&msg)?;
 
         match msg {
             ClientMessage::CreateRoom => {
@@ -205,6 +221,7 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
         _sender: &mpsc::Sender<Message>,
     ) -> AppResult<Option<ConnectionState>> {
         let msg: ClientMessage = serde_json::from_str(text)?;
+        Self::validate_signaling_message(&msg)?;
 
         match msg {
             ClientMessage::Offer { target_id, sdp } => {
@@ -234,4 +251,11 @@ impl<R: RoomRepository + Clone> Orchestrator<R> {
             participant_id: participant_id.to_string(),
         }))
     }
+
+    /// 🛑 Делегирует команду завершения всех соединений в инфраструктурный слой.
+    pub async fn shutdown_connections(&self, code: u16, reason: &str) {
+        self.registry.shutdown_all(code, reason).await;
+    }
+
 }
+

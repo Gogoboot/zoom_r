@@ -1,67 +1,84 @@
 //! Signaling сервер для WebRTC.
-//! Точка входа в приложение.
-
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
-use tokio::signal; // Импорт для перехвата Ctrl+C
+use tokio::signal;
+use tokio::time::Duration;
 use tracing::info;
 
-// Импортируем публичные типы из нашей библиотеки
 use signaling_server::{Config, ConnectionRegistry, MemoryRoomStore, Orchestrator};
 
 #[tokio::main]
 async fn main() -> Result<(), signaling_server::AppError> {
     // 1. Конфигурация
     dotenvy::dotenv().ok();
-    let config = Config::from_env()?;
-    
+    let config = signaling_server::Config::from_env()?;
     tracing_subscriber::fmt()
         .with_env_filter(format!("signaling_server={}", config.log_level.as_str()))
         .init();
 
     // 2. Инфраструктура
-    // Хранилище данных (комнаты, участники)
-    let store = MemoryRoomStore::new();
+    let store = signaling_server::MemoryRoomStore::new();
+    let registry = signaling_server::ConnectionRegistry::new(); 
+
+    // 3. Оркестратор
+    let orchestrator = signaling_server::Orchestrator::new(store, registry);
     
-    // Реестр подключений (сокеты)
-    // Вот он — Registry!
-    let registry = ConnectionRegistry::new(); 
+    // 🔑 ВАЖНО: Клонируем оркестратор перед тем, как он уйдёт в Router
+    // Это позволит нам использовать его для shutdown в main функции
+    let orchestrator_for_shutdown = orchestrator.clone();
 
-    // 3. Оркестратор (Собираем всё вместе)
-    // Передаем И хранилище, И реестр
-    let orchestrator = Orchestrator::new(store, registry);
-
-    // 4. Запуск сервера
+    // 4. Сборка приложения
     let app = Router::new()
         .route("/ws", get(websocket_handler))
         .route("/health", get(|| async { "ok" }))
         .with_state(orchestrator);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
-    info!("Server listening on {}", listener.local_addr()?);
+    tracing::info!("🚀 Server listening on {}", listener.local_addr()?);
 
-    // 5. Сигнал для корректного завершения работы
-    let shutdown_signal = async {
-        signal::ctrl_c().await.expect("Failed to install CTRL+C signal handler");
-        info!("🛑 Получен сигнал остановки (Ctrl+C). Завершаем работу...");
-    };
+    // 5. Логика Graceful Shutdown
+    // Создаём канал, чтобы передать сигнал из задачи в будущее shutdown
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-    // 6. Запуск с поддержкой graceful shutdown
+    // Запускаем задачу, которая слушает Ctrl+C
+    tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("Failed to install CTRL+C handler: {}", e);
+        }
+        // Посылаем сигнал
+        let _ = shutdown_tx.send(());
+    });
+
+    // 6. Запуск сервера
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
+        .with_graceful_shutdown(async move {
+            // Ждём сигнала
+            let _ = shutdown_rx.recv().await;
+            tracing::info!(" Получен сигнал остановки (Ctrl+C).");
+
+            // Этап 1: Вежливо закрываем все соединения (Код 1001)
+            orchestrator_for_shutdown.shutdown_connections(1001, "Server Restarting").await;
+
+            // Этап 2: Ждём 2 секунды, пока клиенты получат Close и обработчики (handle_connection)
+            // успеют выполнить cleanup (handle_leave_room)
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            
+            tracing::info!("✅ Graceful shutdown completed.");
+        })
         .await?;
 
-    info!("✅ Сервер успешно остановлен. Все соединения закрыты.");
+    tracing::info!("🏁 Сервер полностью остановлен.");
     Ok(())
 }
-
+// ✅ ИСПРАВЛЕНО: добавлен конкретный тип хранилища
 async fn websocket_handler(
     ws: axum::extract::WebSocketUpgrade,
-    State(orchestrator): State<Orchestrator<MemoryRoomStore>>,
+    State(orchestrator): State<Orchestrator<MemoryRoomStore>>, 
 ) -> Response {
     ws.on_upgrade(|socket| async move {
         orchestrator.handle_connection(socket).await;
     })
 }
+

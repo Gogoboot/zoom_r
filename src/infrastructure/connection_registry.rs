@@ -1,18 +1,12 @@
 //! Реестр активных соединений.
-//!
-//! Хранит маппинг ParticipantId -> WebSocketSender.
-//! Позволяет отправлять сообщения, не храня sender внутри сущностей домена.
-use std::sync::Arc;
-use axum::extract::ws::Message; // ✅ Добавляем импорт Message
+use axum::extract::ws::{CloseFrame, Message};
 use dashmap::DashMap;
-use tokio::sync::mpsc; // ✅ Добавляем импорт mpsc
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::info;
 
-// ✅ НОВЫЙ ТИП: ограниченный канал с нативными кадрами
-// Ёмкость 64 достаточна для пиков сигнализации (пункт 2)
 pub type WebSocketSender = mpsc::Sender<Message>;
 
-/// Реестр подключений.
-/// Потокобезопасен благодаря Arc.
 #[derive(Clone)]
 pub struct ConnectionRegistry {
     connections: Arc<DashMap<String, WebSocketSender>>,
@@ -25,24 +19,55 @@ impl ConnectionRegistry {
         }
     }
 
-    /// Регистрирует новый сокет для участника.
     pub fn register(&self, participant_id: String, sender: WebSocketSender) {
         self.connections.insert(participant_id, sender);
     }
 
-    /// Удаляет сокет при отключении.
     pub fn unregister(&self, participant_id: &str) {
         self.connections.remove(participant_id);
     }
 
-    /// Получает отправителя для конкретного участника.
-    /// Возвращает клон канала для отправки.
     pub fn get_sender(&self, participant_id: &str) -> Option<WebSocketSender> {
-        self.connections.get(participant_id).map(|entry| entry.value().clone())
+        self.connections
+            .get(participant_id)
+            .map(|entry| entry.value().clone())
     }
 
-    /// Проверяет, онлайн ли участник.
     pub fn is_connected(&self, participant_id: &str) -> bool {
         self.connections.contains_key(participant_id)
+    }
+
+    /// 🛑 Корректно закрывает все активные соединения.
+    /// Отправляет WebSocket Close frame с кодом 1001 (Going Away).
+    pub async fn shutdown_all(&self, code: u16, reason: &str) {
+        use axum::extract::ws::{CloseCode, CloseFrame, Message};
+        use tracing::info;
+
+        let count = self.connections.len();
+        if count == 0 {
+            return;
+        }
+
+        tracing::info!(
+            " Отправка Close frame (code: {}) {} активным соединениям...",
+            code,
+            count
+        );
+
+        // Используем типы axum напрямую. CloseCode implements From<u16>
+        let close_frame = Message::Close(Some(CloseFrame {
+            code: CloseCode::from(code),
+            reason: reason.to_string().into(),
+        }));
+
+        for entry in self.connections.iter() {
+            let sender = entry.value().clone();
+            // Отправляем асинхронно. Ошибки во время shutdown игнорируем,
+            // так как сокет может быть уже частично закрыт.
+            if let Err(e) = sender.send(close_frame.clone()).await {
+                tracing::debug!("Не удалось отправить Close frame участнику: {}", e);
+            }
+        }
+        info!("Отправлено Close({}) всем {} соединениям", code, count);
     }
 }
