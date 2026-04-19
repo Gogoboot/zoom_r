@@ -46,4 +46,3 @@ jobs:
         run: |
           ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
             "sudo systemctl restart signaling-server"
-            
